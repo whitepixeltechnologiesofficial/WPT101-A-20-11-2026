@@ -19,9 +19,7 @@ import {
   timestamp,
   integer,
   index,
-  check,
 } from "drizzle-orm/pg-core";
-import { sql } from "drizzle-orm";
 
 export const smsOutbox = pgTable(
   "sms_outbox",
@@ -60,6 +58,5 @@ export const smsOutbox = pgTable(
   (table) => [
     index("sms_outbox_status_idx").on(table.status),
     index("sms_outbox_created_at_idx").on(table.createdAt),
-    check("sms_outbox_status_check", sql`${table.status} IN ('pending', 'sent', 'failed')`),
   ],
 );

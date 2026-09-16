@@ -1,6 +1,6 @@
 // app/legal-acceptance.tsx
 import { router } from 'expo-router';
-// import { LinearGradient } from 'expo-linear-gradient'; // shimmed for Expo Go
+import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
 import React, { useCallback, useEffect, useState } from 'react';
 import {
@@ -15,6 +15,8 @@ import {
   View,
 } from 'react-native';
 import { Fonts } from '@/constants/typography';
+import { recordLegalAcceptance } from '@/lib/legal-acceptance';
+import { useOnboardingGuard } from '@/providers/OnboardingGuardProvider';
 
 const C = {
   bg: '#0B0F14',
@@ -37,7 +39,7 @@ const TERMS_SECTIONS: { title: string; body: string }[] = [
   },
   {
     title: '2. Eligibility',
-    body: 'You must be at least 18 years old, or the age of majority in your jurisdiction, to use this app. By using the app, you represent and warrant that you meet these requirements and that you have not been previously suspended or removed from the service.',
+    body: 'You must be at least 16 years old to use this app. By using the app, you represent and warrant that you meet this age requirement and that you have not been previously suspended or removed from the service.',
   },
   {
     title: '3. Your Account',
@@ -84,6 +86,7 @@ export default function LegalAcceptanceScreen() {
   const [hasReadTerms, setHasReadTerms] = useState(false);
   const [viewportH, setViewportH] = useState(0);
   const [contentH, setContentH] = useState(0);
+  const { markLegalAccepted } = useOnboardingGuard();
 
   const goBack = useCallback(() => {
     router.back();
@@ -97,8 +100,14 @@ export default function LegalAcceptanceScreen() {
     return () => sub.remove();
   }, [goBack]);
 
-  const handleContinue = () => {
+  const handleContinue = async () => {
     if (!accepted) return;
+    try {
+      await recordLegalAcceptance();
+    } catch {
+      // phone-entry/otp-entry re-check the gate and bounce back.
+    }
+    markLegalAccepted();
     router.push('/phone-entry');
   };
 
@@ -129,7 +138,7 @@ export default function LegalAcceptanceScreen() {
     : null;
 
   return (
-    <View
+    <LinearGradient
       colors={[C.bg2, C.bg]}
       start={{ x: 0.5, y: 0 }}
       end={{ x: 0.5, y: 0.45 }}
@@ -202,7 +211,7 @@ export default function LegalAcceptanceScreen() {
             {accepted ? <Text style={styles.checkmark}>✓</Text> : null}
           </View>
           <Text style={styles.checkboxText}>
-            I have read and accept the Terms &amp; Conditions
+            I am 16 or older and I have read and accept the Terms &amp; Conditions
           </Text>
         </Pressable>
 
@@ -218,7 +227,7 @@ export default function LegalAcceptanceScreen() {
           </Pressable>
         </View>
       </View>
-    </View>
+    </LinearGradient>
   );
 }
 

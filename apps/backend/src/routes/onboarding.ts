@@ -27,18 +27,16 @@ import {
   issueRefreshToken,
   validateRefreshToken,
 } from "../auth/index.js";
-import { getDb, type AppDb } from "../db/index.js";
+import { getDb } from "../db/index.js";
 import { sessions } from "../db/sessions-schema.js";
 import { users } from "../db/users-schema.js";
 import { otpVerifications } from "../db/otp-verifications-schema.js";
 import { smsOutbox } from "../db/sms-outbox-schema.js";
-import { contactHashes } from "../db/contact-hashes-schema.js";
 import { pushForceLogout } from "../ws/socket-registry.js";
 import { deliverOtpCode } from "../sms/sender.js";
 import { requireAuth } from "../middleware/auth.js";
 import { rateLimit } from "../middleware/rate-limit.js";
-import { phoneHash } from "../utils/phone-hash.js";
-import { normalizePhoneNumber } from "../utils/phone-normalize.js";
+import { isValidE164 } from "../middleware/validation.js";
 
 const router: Router = Router();
 
@@ -118,22 +116,12 @@ async function executeHandoffTransaction({
         userId = existingUser.id;
         routing = "chats";
       } else {
-        // New user registration — create user + contact_hashes row in same transaction (Tech Arch §14.4)
         userId = randomUUID();
-        const hash = phoneHash(phoneNumber);
-
-        await Promise.all([
-          tx.insert(users).values({
-            id: userId,
-            phoneNumber,
-            name: "",
-          }),
-          tx.insert(contactHashes).values({
-            phoneHash: hash,
-            userId,
-          }),
-        ]);
-
+        await tx.insert(users).values({
+          id: userId,
+          phoneNumber,
+          name: "",
+        });
         routing = "profile_setup";
       }
     }
@@ -152,7 +140,7 @@ async function executeHandoffTransaction({
     const { refreshToken, sessionId } = await issueRefreshToken({
       userId,
       deviceId,
-      db: tx as unknown as AppDb,
+      db: tx,
     });
 
     const accessToken = await issueAccessToken({
@@ -174,21 +162,10 @@ async function executeHandoffTransaction({
 // ──────────────────────────────────────────────────
 router.post("/accept-legal", async (req: Request, res: Response) => {
   try {
-    const { phoneNumber: rawPhoneNumber } = req.body as { phoneNumber?: string };
+    const { phoneNumber } = req.body as { phoneNumber?: string };
 
-    if (!rawPhoneNumber || typeof rawPhoneNumber !== "string") {
+    if (!phoneNumber || typeof phoneNumber !== "string") {
       res.status(400).json({ error: "phoneNumber is required" });
-      return;
-    }
-
-    // Normalize phone number to E.164 format (supports different input formats)
-    const phoneNumber = normalizePhoneNumber(rawPhoneNumber);
-
-    if (!phoneNumber) {
-      res.status(400).json({
-        error: "INVALID_PHONE",
-        message: "Phone number must be valid (e.g. +1234567890, or 1234567890 with country)",
-      });
       return;
     }
 
@@ -198,7 +175,7 @@ router.post("/accept-legal", async (req: Request, res: Response) => {
     });
 
     res.json({ success: true });
-  } catch (_err) {
+  } catch {
     console.error("POST /accept-legal error");
     res.status(500).json({ error: "Internal server error" });
   }
@@ -218,20 +195,17 @@ router.post(
   }),
   async (req: Request, res: Response) => {
     try {
-      const { phoneNumber: rawPhoneNumber } = req.body as { phoneNumber?: string };
+      const { phoneNumber } = req.body as { phoneNumber?: string };
 
-      if (!rawPhoneNumber || typeof rawPhoneNumber !== "string") {
+      if (!phoneNumber || typeof phoneNumber !== "string") {
         res.status(400).json({ error: "phoneNumber is required" });
         return;
       }
 
-      // Normalize phone number to E.164 format (supports different input formats)
-      const phoneNumber = normalizePhoneNumber(rawPhoneNumber);
-
-      if (!phoneNumber) {
+      if (!isValidE164(phoneNumber)) {
         res.status(400).json({
           error: "INVALID_PHONE",
-          message: "Phone number must be valid (e.g. +1234567890, or 1234567890 with country)",
+          message: "Phone number must be in E.164 format (e.g. +1234567890)",
         });
         return;
       }
@@ -241,10 +215,24 @@ router.post(
 
       // Resend cooldown check (independent 30s timer, §7.2)
       const [existing] = await db
-        .select({ sentAt: otpVerifications.sentAt })
+        .select({ sentAt: otpVerifications.sentAt, lockedUntil: otpVerifications.lockedUntil })
         .from(otpVerifications)
         .where(eq(otpVerifications.phoneNumber, phoneNumber))
         .limit(1);
+
+      // SEC (ONB-1.4): a fresh OTP must NOT clear an active lockout — sending
+      // a new code (and thus a fresh verification row) would reset the attempt
+      // counter and bypass the 30s block. Refuse resends while locked, mirroring
+      // the mobile mock contract (client handles OTP_LOCKED_OUT / 429).
+      if (existing && existing.lockedUntil && now < existing.lockedUntil) {
+        res.status(429).json({
+          error: "OTP_LOCKED_OUT",
+          secondsRemaining: Math.ceil(
+            (existing.lockedUntil.getTime() - now.getTime()) / 1000,
+          ),
+        });
+        return;
+      }
 
       if (existing) {
         const elapsed = now.getTime() - existing.sentAt.getTime();
@@ -285,7 +273,7 @@ router.post(
       await deliverOtpCode(phoneNumber, rawCode);
 
       res.json({ success: true });
-    } catch (_err) {
+    } catch {
       console.error("POST /otp/send error");
       res.status(500).json({ error: "Internal server error" });
     }
@@ -306,20 +294,17 @@ router.post(
   }),
   async (req: Request, res: Response) => {
     try {
-      const { phoneNumber: rawPhoneNumber, code } = req.body as {
+      const { phoneNumber, code } = req.body as {
         phoneNumber?: string;
         code?: string;
       };
 
-      if (!rawPhoneNumber || !code) {
+      if (!phoneNumber || !code) {
         res.status(400).json({ error: "phoneNumber and code are required" });
         return;
       }
 
-      // Normalize phone number to E.164 format (supports different input formats)
-      const phoneNumber = normalizePhoneNumber(rawPhoneNumber);
-
-      if (!phoneNumber) {
+      if (!isValidE164(phoneNumber)) {
         res.status(400).json({ error: "INVALID_PHONE" });
         return;
       }
@@ -389,7 +374,13 @@ router.post(
             .set({ attempts: newAttempts, lockedUntil })
             .where(eq(otpVerifications.phoneNumber, phoneNumber));
 
-          res.json({ status: "attempts_exhausted" });
+          // 3rd wrong attempt → start the 30s lockout. Return `locked_out`
+          // with the remaining seconds so the mobile OTP screen renders the
+          // visible countdown (matches the mobile mock contract).
+          res.json({
+            status: "locked_out",
+            secondsRemaining: Math.ceil(LOCKOUT_MS / 1000),
+          });
           return;
         }
 
@@ -404,7 +395,14 @@ router.post(
       }
 
       // SUCCESS — Atomic handoff transaction
-      const deviceId = `device_${Date.now()}_${randomBytes(4).toString("hex")}`;
+      // Accept an optional client-provided deviceId so the client can use a
+      // stable device identity across logins (ONB-1.7). Falls back to
+      // server-generated if omitted (backward compatibility).
+      const { deviceId: clientDeviceId } = req.body as { deviceId?: string };
+      const deviceId =
+        clientDeviceId && typeof clientDeviceId === "string" && clientDeviceId.length > 0
+          ? clientDeviceId
+          : `device_${Date.now()}_${randomBytes(4).toString("hex")}`;
       const result = await executeHandoffTransaction({
         userId: "",
         deviceId,
@@ -418,8 +416,9 @@ router.post(
         refreshToken: result.refreshToken,
         userId: result.userId,
         sessionId: result.sessionId,
+        previousDevicesLoggedOut: result.revokedCount,
       });
-    } catch (_err) {
+    } catch {
       console.error("POST /otp/verify error");
       res.status(500).json({ error: "Internal server error" });
     }
@@ -432,16 +431,14 @@ router.post(
 // ──────────────────────────────────────────────────
 router.post("/check-existing-user", async (req: Request, res: Response) => {
   try {
-    const { phoneNumber: rawPhoneNumber } = req.body as { phoneNumber?: string };
+    const { phoneNumber } = req.body as { phoneNumber?: string };
 
-    if (!rawPhoneNumber || typeof rawPhoneNumber !== "string") {
+    if (!phoneNumber || typeof phoneNumber !== "string") {
       res.status(400).json({ error: "phoneNumber is required" });
       return;
     }
 
-    const phoneNumber = normalizePhoneNumber(rawPhoneNumber);
-
-    if (!phoneNumber) {
+    if (!isValidE164(phoneNumber)) {
       res.status(400).json({ error: "INVALID_PHONE" });
       return;
     }
@@ -455,7 +452,7 @@ router.post("/check-existing-user", async (req: Request, res: Response) => {
 
     // Only return boolean — never leak userId here
     res.json({ exists: !!existingUser });
-  } catch (_err) {
+  } catch {
     console.error("POST /check-existing-user error");
     res.status(500).json({ error: "Internal server error" });
   }
@@ -489,7 +486,7 @@ router.post("/refresh", async (req: Request, res: Response) => {
     });
 
     res.json({ accessToken });
-  } catch (_err) {
+  } catch {
     console.error("POST /refresh error");
     res.status(500).json({ error: "Internal server error" });
   }
@@ -540,7 +537,7 @@ router.post("/login/handoff", async (req: Request, res: Response) => {
       message: `You're now logged in here on ${deviceInfo.deviceName}`,
       previousDevicesLoggedOut: handoff.revokedCount,
     });
-  } catch (_err) {
+  } catch {
     console.error("POST /login/handoff error");
     res.status(500).json({ error: "Internal server error" });
   }
@@ -580,7 +577,7 @@ router.post("/session/check", requireAuth, async (req: Request, res: Response) =
     }
 
     res.json({ isValid: true });
-  } catch (_err) {
+  } catch {
     console.error("POST /session/check error");
     res.status(500).json({ error: "Internal server error" });
   }

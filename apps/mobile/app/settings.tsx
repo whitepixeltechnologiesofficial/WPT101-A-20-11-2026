@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import {
   View,
   Text,
@@ -16,7 +16,7 @@ import { router } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useThemeContext } from '@/providers/ThemeProvider';
 import { useSessionContext } from '@/providers/SessionProvider';
-import { moderationApi } from '@/api/moderationApi';
+import { useRouteGuard } from '@/hooks/useRouteGuard';
 import type { ThemeMode, ThemeColors } from '@/lib/theme';
 
 const FONTS = {
@@ -130,6 +130,9 @@ function ThemePicker({
 }
 
 export default function SettingsScreen() {
+  // ROUTE-GATE — settings is authenticated-only; never renderable from a fresh
+  // direct URL with identity-bearing query params.
+  const snapshot = useRouteGuard('settings');
   const { colors, themeMode, setThemeMode } = useThemeContext();
   const { displayPhone, logout } = useSessionContext();
   const [readReceipts, setReadReceipts] = useState(true);
@@ -137,22 +140,9 @@ export default function SettingsScreen() {
   const [notifications, setNotifications] = useState(true);
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [enterToSend, setEnterToSend] = useState(false);
-  const [blockedCount, setBlockedCount] = useState(0);
 
-  useEffect(() => {
-    let alive = true;
-    moderationApi
-      .listBlocked()
-      .then((res) => {
-        if (alive) setBlockedCount(res.blockedPhoneHashes.length);
-      })
-      .catch(() => {
-        /* ignore — count stays 0 if network/token unavailable */
-      });
-    return () => {
-      alive = false;
-    };
-  }, []);
+  // Render nothing until the centralized guard allows the route.
+  if (!snapshot) return null;
 
   const handleLogout = () => {
     Alert.alert('Log Out', 'Are you sure you want to log out?', [
@@ -197,17 +187,6 @@ export default function SettingsScreen() {
       >
         <ProfileCard colors={colors} phone={displayPhone || ''} />
 
-        <SectionHeader title="Scan & Link" colors={colors} />
-        <View style={[ss.sectionCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
-          <SettingRow
-            icon="qr-code-outline"
-            label="Scan QR Code"
-            value="Open web app"
-            colors={colors}
-            onPress={() => router.push('/scan')}
-          />
-        </View>
-
         <SectionHeader title="Account" colors={colors} />
         <View style={[ss.sectionCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
           <SettingRow icon="person-outline" label="Edit Profile" colors={colors} onPress={() => {}} />
@@ -245,7 +224,7 @@ export default function SettingsScreen() {
               />
             }
           />
-          <SettingRow icon="ban-outline" label="Blocked Contacts" value={String(blockedCount)} colors={colors} onPress={() => router.push('/blocked-contacts')} />
+          <SettingRow icon="ban-outline" label="Blocked Contacts" value="0" colors={colors} onPress={() => {}} />
         </View>
 
         <SectionHeader title="Notifications" colors={colors} />

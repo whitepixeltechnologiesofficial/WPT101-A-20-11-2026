@@ -1,31 +1,44 @@
+import "dotenv/config";
 import { drizzle } from "drizzle-orm/node-postgres";
 import pg from "pg";
 import * as schema from "./schema.js";
 
 const { Pool } = pg;
 
-let _db: ReturnType<typeof drizzle<typeof schema>> | null = null;
+export type AppDb = ReturnType<typeof drizzle<typeof schema>>;
+
+let _db: AppDb | null = null;
 
 /**
- * Returns a shared Drizzle instance backed by a pg Pool.
+ * Returns a shared Drizzle database instance.
  *
- * The pool reads DATABASE_URL from the environment once and reuses
- * connections for the lifetime of the process.
+ * The connection pool is created only once and reused
+ * for the lifetime of the backend process.
  */
-export function getDb() {
-  if (_db) return _db;
-
-  const connectionString = process.env.DATABASE_URL;
-  if (!connectionString) {
-    throw new Error("DATABASE_URL is not set");
+export function getDb(): AppDb {
+  if (_db) {
+    return _db;
   }
 
-  const pool = new Pool({ connectionString });
+  if (!process.env.DATABASE_URL) {
+    throw new Error("DATABASE_URL environment variable is missing.");
+  }
+
+  const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: {
+      rejectUnauthorized: false,
+    },
+  });
+
   _db = drizzle(pool, { schema });
+
   return _db;
 }
 
-export { schema };
-
-/** Drizzle database type — use for optional db parameters in auth functions. */
-export type AppDb = ReturnType<typeof drizzle<typeof schema>>;
+/**
+ * Default database instance.
+ *
+ * Kept for existing backend code that imports `db`.
+ */
+export const db = getDb();

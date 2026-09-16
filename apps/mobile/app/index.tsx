@@ -13,6 +13,8 @@ import {
   BackHandler,
 } from 'react-native';
 import { useRouter, useFocusEffect } from 'expo-router';
+import { useOnboardingGuard } from '@/providers/OnboardingGuardProvider';
+import { decideSplashAction } from '@/lib/onboarding-guard';
 
 const RING_ENABLED = false;
 
@@ -29,8 +31,8 @@ const COLORS = {
 
 export default function Index() {
   const router = useRouter();
+  const { snapshot } = useOnboardingGuard();
 
-  // Block hardware back on the splash screen (no going "back" to nothing)
   useFocusEffect(
     useCallback(() => {
       const sub = BackHandler.addEventListener('hardwareBackPress', () => true);
@@ -63,10 +65,11 @@ export default function Index() {
   }, [breathe]);
 
   const handlePress = useCallback(() => {
+    const action = decideSplashAction(snapshot);
     setTimeout(() => {
-      router.push('/legal-acceptance');
+      router.push(action);
     }, 250);
-  }, [router]);
+  }, [router, snapshot]);
 
   const haloScale = breathe.interpolate({ inputRange: [0, 1], outputRange: [0.92, 1.06] });
   const haloOpacity = breathe.interpolate({ inputRange: [0, 1], outputRange: [0.6, 1] });
@@ -136,7 +139,7 @@ const styles = StyleSheet.create({
     letterSpacing: 2,
     textTransform: 'uppercase',
     color: COLORS.inkFaint,
-    fontFamily: 'Lato-Bold',
+    fontFamily: 'Lora-Bold',
   },
   center: {
     flex: 1,
@@ -162,14 +165,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   wordmark: {
-    fontFamily: 'Lato-Bold',
+    fontFamily: 'Lora-Bold',
     fontSize: 64,
     letterSpacing: 9,
     color: COLORS.ink,
   },
   tagline: {
     marginTop: 6,
-    fontFamily: 'Lato-Italic',
+    fontFamily: 'Inter-Regular',
     fontStyle: 'italic',
     opacity: 0.6,
     fontSize: 9,
@@ -188,7 +191,7 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     color: COLORS.inkDim,
     fontWeight: '500',
-    fontFamily: 'Lato-Bold',
+    fontFamily: 'Inter-Medium',
   },
   ctaLine: {
     width: 34,

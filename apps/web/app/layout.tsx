@@ -1,10 +1,10 @@
-import type { ReactNode } from "react";
+import type { JSX, ReactNode } from "react";
 
 export const metadata = {
   title: "WPT",
 };
 
-export default function RootLayout({ children }: { children: ReactNode }) {
+export default function RootLayout({ children }: { children: ReactNode }): JSX.Element {
   return (
     <html lang="en">
       <body>{children}</body>

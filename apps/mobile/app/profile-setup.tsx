@@ -1,7 +1,8 @@
 // app/profile-setup.tsx
-import { router, useLocalSearchParams } from 'expo-router';
-import React, { useState } from 'react';
+import { router } from 'expo-router';
+import React, { useEffect, useRef, useState } from 'react';
 import {
+  AppState,
   Platform,
   Pressable,
   StyleSheet,
@@ -15,10 +16,18 @@ import {
   TouchableOpacity,
   ActivityIndicator,
   Modal,
+  Linking,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
 import { onboardingApi } from '@/api/onboardingApi';
+import { useRouteGuard } from '@/hooks/useRouteGuard';
+import {
+  requestCameraPermission,
+  requestPhotosPermission,
+  checkCameraState,
+  checkPhotosState,
+} from '@/lib/permissions';
 import { Ionicons } from '@expo/vector-icons';
 
 const COLORS = {
@@ -37,13 +46,22 @@ const COLORS = {
 const DEFAULT_ABOUT = "Hey there! I'm using ONB";
 
 export default function ProfileSetupScreen() {
-  const params = useLocalSearchParams<{ phoneNumber?: string; displayPhone?: string }>();
+  // ROUTE-GATE — profile-setup is authenticated-only (post-OTP). A direct URL
+  // like /profile-setup?phoneNumber=9876543210 is blocked BEFORE anything
+  // renders; on allow the VERIFIED identity from SecureStore is used instead of
+  // untrusted URL params.
+  const snapshot = useRouteGuard('profile-setup');
+  // Identity comes from the OTP-verified session snapshot, not URL params.
+  const displayPhone = snapshot?.displayPhone ?? '';
   const [name, setName] = useState('');
   const [photo, setPhoto] = useState<string | null>(null);
   const [about, setAbout] = useState(DEFAULT_ABOUT);
   const [isLoading, setIsLoading] = useState(false);
   const [isPickingImage, setIsPickingImage] = useState(false);
   const [showPhotoModal, setShowPhotoModal] = useState(false);
+  const [cameraDenied, setCameraDenied] = useState(false);
+  const [photosDenied, setPhotosDenied] = useState(false);
+  const appStateRef = useRef(AppState.currentState);
 
   const hasVisibleChars = (text: string): boolean => text.trim().length > 0;
   const isNameValid = hasVisibleChars(name);
@@ -52,10 +70,46 @@ export default function ProfileSetupScreen() {
   const handleAboutChange = (text: string) => setAbout(text);
   const handleAboutBlur = () => { if (!about.trim()) setAbout(DEFAULT_ABOUT); };
 
+  // PERM-2.13 (recheck on foreground): the OS is the source of truth. If the
+  // user denied a permission, opened Settings, granted it, and returned, the
+  // internal denied state is cleared so no restart / manual refresh is needed.
+  // No camera/gallery is opened automatically — the user taps the action again.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (next) => {
+      if (appStateRef.current === 'active' && next === 'active') return;
+      appStateRef.current = next;
+      if (next !== 'active') return;
+      if (cameraDenied) checkCameraState().then((s) => setCameraDenied(s === 'denied'));
+      if (photosDenied) checkPhotosState().then((s) => setPhotosDenied(s === 'denied'));
+    });
+    return () => sub.remove();
+  }, [cameraDenied, photosDenied]);
+
+  // Settings-directed denial prompt. Reused across Camera and Photos/Files so
+  // both features stay independent but consistent (PERM-DENIED rule).
+  const promptPermissionSettings = (title: string, message: string) => {
+    Alert.alert(title, message, [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Settings', onPress: () => Linking.openSettings() },
+    ]);
+  };
+
   const handlePickImage = async () => {
+    setPhotosDenied(false);
+    setIsPickingImage(true);
+    setShowPhotoModal(false);
     try {
-      setIsPickingImage(true);
-      setShowPhotoModal(false);
+      if ((await checkPhotosState()) !== 'granted') {
+        const res = await requestPhotosPermission();
+        if (!res.granted) {
+          setPhotosDenied(true);
+          promptPermissionSettings(
+            'Photos access needed',
+            "To choose a photo from your gallery, allow Photo access in your device's Settings.",
+          );
+          return;
+        }
+      }
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
         allowsEditing: true,
@@ -72,13 +126,20 @@ export default function ProfileSetupScreen() {
   };
 
   const handleTakePhoto = async () => {
+    setCameraDenied(false);
+    setIsPickingImage(true);
+    setShowPhotoModal(false);
     try {
-      setIsPickingImage(true);
-      setShowPhotoModal(false);
-      const { status } = await ImagePicker.requestCameraPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('Permission needed', 'Please grant camera permissions.');
-        return;
+      if ((await checkCameraState()) !== 'granted') {
+        const res = await requestCameraPermission();
+        if (!res.granted) {
+          setCameraDenied(true);
+          promptPermissionSettings(
+            'Camera access needed',
+            "To take a photo, allow Camera access in your device's Settings.",
+          );
+          return;
+        }
       }
       const result = await ImagePicker.launchCameraAsync({
         allowsEditing: true,
@@ -118,7 +179,16 @@ export default function ProfileSetupScreen() {
         photo: photo || undefined,
         about: about.trim() || DEFAULT_ABOUT,
       });
-      router.replace('/(tabs)');
+      // After profile creation, explain the optional permissions (Notifications
+      // and Contacts) before entering the Chat List. Forward ONLY the verified
+      // display phone from the session snapshot — never raw URL params.
+      router.replace({
+        pathname: '/permission-intro',
+        params: {
+          phoneNumber: displayPhone,
+          displayPhone,
+        },
+      });
     } catch (error: any) {
       Alert.alert('Error', error.message || 'Failed to set up profile.');
     } finally {
@@ -126,7 +196,10 @@ export default function ProfileSetupScreen() {
     }
   };
 
-  const displayPhone = params.displayPhone || params.phoneNumber || '';
+  // ROUTE-GATE result: render nothing until the centralized guard allows the
+  // route. While pending or blocked, the screen never paints untrusted URL
+  // content (and the hook redirects to legal/phone-entry when blocked).
+  if (!snapshot) return null;
 
   return (
     <SafeAreaView style={styles.root} edges={['top']}>
