@@ -13,3 +13,7 @@ export { pendingMessages } from "./pending-messages-schema.js";
 export { phoneReuseCooldowns } from "./phone-reuse-cooldowns-schema.js";
 export { signedPrekeys, oneTimePrekeys } from "./prekeys-schema.js";
 export { messageStatus } from "./message-status-schema.js";
+export { dashboardSessions } from "./dashboard-sessions-schema.js";
+export { pushTokens, pushProvider } from "./push-tokens-schema.js";
+export { chatMutes } from "./chat-mutes-schema.js";
+export { rateLimitCounters } from "./rate-limit-counters-schema.js";
