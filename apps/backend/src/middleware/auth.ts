@@ -7,8 +7,11 @@
  */
 
 import type { Request, Response, NextFunction } from "express";
+import { eq } from "drizzle-orm";
 import { verifyAccessToken } from "../auth/jwt.js";
 import type { AccessTokenPayload } from "../auth/types.js";
+import { getDb } from "../db/index.js";
+import { sessions } from "../db/sessions-schema.js";
 
 declare global {
   namespace Express {
@@ -46,11 +49,34 @@ export async function requireAuth(
     return;
   }
 
+  let payload: AccessTokenPayload;
   try {
-    const payload = await verifyAccessToken(token);
-    res.locals.auth = payload;
-    next();
+    payload = await verifyAccessToken(token);
   } catch {
     res.status(401).json({ error: "INVALID_TOKEN" });
+    return;
   }
+
+  // A valid signature is not enough: log-off (/linking/logoff), new-phone
+  // login (§7.3 handoff) and refresh-token reuse all revoke the SESSION, and
+  // an access token from a revoked session must stop working at once, not
+  // when it expires up to an hour later (WEB-R1.6 / WEB-R1.8; same check the
+  // socket handshake already does, TAD §9.5).
+  try {
+    const [session] = await getDb()
+      .select({ revokedAt: sessions.revokedAt })
+      .from(sessions)
+      .where(eq(sessions.id, payload.sid))
+      .limit(1);
+    if (session?.revokedAt) {
+      res.status(401).json({ error: "SESSION_REVOKED" });
+      return;
+    }
+  } catch {
+    res.status(503).json({ error: "AUTH_UNAVAILABLE" });
+    return;
+  }
+
+  res.locals.auth = payload;
+  next();
 }

@@ -22,6 +22,9 @@
  *   POST /__mock/scan            { token? }   simulate the phone scanning (newest QR if no token)
  *   POST /__mock/force-logout                 simulate a new-phone login (§7.3)
  *   POST /__mock/phone-presence  { online }   phone goes offline / online
+ *   POST /__mock/send-to-web     { count }    phone sends messages to the linked Web
+ *   POST /__mock/drop-web-connection { backlog }  transport drop + messages queued in the gap
+ *   POST /__mock/network         { down }     simulate an outage of the HTTP API
  *
  * State is in memory. No users are hard-coded beyond the single mock phone
  * account that "scans"; there is no fake chat data.
@@ -46,6 +49,7 @@ import {
   type LinkingRegisterRequest,
   type LinkingScanError,
   type PhonePresencePayload,
+  type RelayMessage,
 } from "@wpt/shared";
 
 export interface MockServerOptions {
@@ -65,9 +69,21 @@ export interface MockServer {
     setPhoneOnline(online: boolean): void;
     /** The phone account's current access token (for calling /linking/scan directly). */
     phoneAccessToken(): string;
-    queuedMessages(): ReadonlyArray<{ clientMessageId: string; deviceId: string; ciphertext: string }>;
+    queuedMessages(): ReadonlyArray<QueuedMessage>;
+    /** Queue `count` phone → Web messages (pushed live if Web is connected). */
+    sendToWeb(count: number): number;
   };
 }
+
+export interface QueuedMessage {
+  deviceId: string;
+  clientMessageId: string;
+  ciphertext: string;
+  message: RelayMessage;
+}
+
+/** Same per-connect cap idea as ws/offline-drain.ts; the rest → queue_more. */
+const DRAIN_CAP = 50;
 
 type Tombstone = "expired" | "used";
 
@@ -107,8 +123,24 @@ export async function startMockServer(opts: MockServerOptions = {}): Promise<Moc
   const accessTokens = new Map<string, string>(); // token -> sessionId
   const refreshTokens = new Map<string, { sessionId: string; rotated: boolean }>();
   const devices = new Map<string, Device>();
-  const queued: Array<{ clientMessageId: string; deviceId: string; ciphertext: string }> = [];
+  const queued: QueuedMessage[] = [];
   let phoneOnline = true;
+  let apiDown = false;
+
+  /** Durable first, then a best-effort live push (same order as BE-5.4). */
+  function enqueue(deviceId: string, senderDeviceId: string, ciphertext: string, clientMessageId: string) {
+    const message: RelayMessage = {
+      id: randomUUID(),
+      senderDeviceId,
+      ciphertext,
+      messageType: "text",
+      sizeBytes: ciphertext.length / 2,
+      clientMessageId,
+      createdAt: new Date().toISOString(),
+    };
+    queued.push({ deviceId, clientMessageId, ciphertext, message });
+    io.to(`device:${deviceId}`).emit(SESSION_EVENTS.message, message);
+  }
 
   const opaque = (p: string) => `${p}_${randomBytes(24).toString("base64url")}`;
 
@@ -265,6 +297,12 @@ export async function startMockServer(opts: MockServerOptions = {}): Promise<Moc
     }
     if (req.method !== "POST") return send(res, 404, { error: "NOT_FOUND" });
 
+    // Simulated outage: API calls fail at the network level, like being offline.
+    if (apiDown && url.pathname.startsWith(`/api/`)) {
+      req.socket.destroy();
+      return;
+    }
+
     const body = await readJson(req);
     switch (url.pathname) {
       case api(LINKING_API.scan): {
@@ -309,13 +347,43 @@ export async function startMockServer(opts: MockServerOptions = {}): Promise<Moc
         }
         // Deliberately NOT gated on phoneOnline: Web is its own device (WEB-R1.4).
         for (const r of recipients) {
-          queued.push({
-            clientMessageId: body.clientMessageId,
-            deviceId: String(r.deviceId),
-            ciphertext: String(r.ciphertext),
-          });
+          enqueue(String(r.deviceId), s.deviceId, String(r.ciphertext), body.clientMessageId);
         }
         return send(res, 200, { count: recipients.length });
+      }
+      case api("/relay/poll"): {
+        const s = authSession(bearer(req));
+        if (!s) return send(res, 401, { error: "INVALID_TOKEN" });
+        const messages: RelayMessage[] = queued.filter((q) => q.deviceId === s.deviceId).map((q) => q.message);
+        return send(res, 200, { messages });
+      }
+      case "/__mock/drop-web-connection": {
+        // Transport-level drop (like Wi-Fi blipping): the client auto-reconnects.
+        // Messages queued during the gap are drained on reconnect (WEB-R1.5).
+        const web = [...devices.values()].find((d) => d.type === "web" && !d.revoked);
+        if (!web) return send(res, 404, { error: "NO_LINKED_WEB" });
+        for (const sock of await io.in(`device:${web.id}`).fetchSockets()) {
+          io.sockets.sockets.get(sock.id)?.conn.close();
+        }
+        const backlog = Math.min(Math.max(Number(body.backlog) || 0, 0), 5_000);
+        setTimeout(() => {
+          for (let i = 0; i < backlog; i++) enqueue(web.id, phoneDevice.id, randomBytes(16).toString("hex"), randomUUID());
+        }, 50);
+        return send(res, 200, { ok: true, backlog });
+      }
+      case "/__mock/network": {
+        apiDown = body.down === true;
+        return send(res, 200, { ok: true, apiDown });
+      }
+      case "/__mock/send-to-web": {
+        // The phone sends `count` messages to the linked Web device. They are
+        // pushed live if Web is connected, and drained on its next reconnect
+        // otherwise (WEB-R1.5 backlog).
+        const web = [...devices.values()].find((d) => d.type === "web" && !d.revoked);
+        if (!web) return send(res, 404, { error: "NO_LINKED_WEB" });
+        const count = Math.min(Math.max(Number(body.count) || 1, 1), 5_000);
+        for (let i = 0; i < count; i++) enqueue(web.id, phoneDevice.id, randomBytes(16).toString("hex"), randomUUID());
+        return send(res, 200, { ok: true, count });
       }
       case "/__mock/scan": {
         const token = typeof body.token === "string" ? body.token : newestPendingToken();
@@ -391,6 +459,11 @@ export async function startMockServer(opts: MockServerOptions = {}): Promise<Moc
     const { userId, deviceId } = socket.handshake.auth as { userId: string; deviceId: string };
     void socket.join([`user:${userId}`, `device:${deviceId}`]);
     socket.emit(SESSION_EVENTS.phonePresence, { online: phoneOnline, at: new Date().toISOString() });
+    // Reconnect drain (BE-5.6 parity): push what queued while offline, capped
+    // per connect; past the cap the client pulls the rest via /relay/poll.
+    const backlog = queued.filter((q) => q.deviceId === deviceId);
+    for (const q of backlog.slice(0, DRAIN_CAP)) socket.emit(SESSION_EVENTS.message, q.message);
+    if (backlog.length > DRAIN_CAP) socket.emit(SESSION_EVENTS.queueMore);
   });
 
   // TTL sweep: tell a still-connected Web its QR died so it regenerates.
@@ -420,6 +493,12 @@ export async function startMockServer(opts: MockServerOptions = {}): Promise<Moc
       setPhoneOnline,
       phoneAccessToken: () => phoneAccess,
       queuedMessages: () => queued,
+      sendToWeb: (count: number) => {
+        const web = [...devices.values()].find((d) => d.type === "web" && !d.revoked);
+        if (!web) return 0;
+        for (let i = 0; i < count; i++) enqueue(web.id, phoneDevice.id, randomBytes(16).toString("hex"), randomUUID());
+        return count;
+      },
     },
   };
 }
@@ -435,6 +514,9 @@ code{font-size:12px;word-break:break-all}li{margin:6px 0}.muted{color:#666}</sty
 <button onclick="post('/__mock/phone-presence',{online:false})">Phone offline</button>
 <button onclick="post('/__mock/phone-presence',{online:true})">Phone online</button>
 <button onclick="post('/__mock/force-logout',{})">New-phone login (force_logout)</button>
+<h2>Messages</h2>
+<button onclick="post('/__mock/send-to-web',{count:1})">Send 1 to Web</button>
+<button onclick="post('/__mock/send-to-web',{count:500})">Send 500 to Web (backlog)</button>
 <p id="out" class="muted"></p>
 <script>
 async function post(p,b){const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});

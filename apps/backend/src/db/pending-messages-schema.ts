@@ -20,6 +20,7 @@ import {
   index,
   uniqueIndex,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { devices } from "./devices-schema.js";
 
 /** bytea column: stores binary ciphertext as a Buffer. */
@@ -66,6 +67,10 @@ export const pendingMessages = pgTable(
     index("idx_pending_messages_expires").on(table.expiresAt),
     index("idx_pending_messages_created").on(table.createdAt),
     index("idx_pending_messages_voice_group").on(table.voiceSegmentGroupId),
+    // WEB-R1.5 (migration 022): reconnect drain = one range scan per page.
+    index("idx_pending_messages_drain")
+      .on(table.recipientDeviceId, table.createdAt, table.id)
+      .where(sql`${table.deliveredAt} IS NULL`),
     uniqueIndex("pending_messages_client_msg_uniq_idx").on(
       table.senderDeviceId,
       table.recipientDeviceId,

@@ -71,11 +71,24 @@ export function pushForceLogout(userId: string, excludeDeviceId: string): void {
   if (!set || set.size === 0) return;
 
   let pushed = 0;
+  const kicked: string[] = [];
   for (const entry of set) {
     if (entry.deviceId !== excludeDeviceId) {
       ioRef.to(entry.socketId).emit("force_logout");
+      kicked.push(entry.socketId);
       pushed++;
     }
+  }
+
+  // Then hard-close those sockets server-side (WEB-R1.8). The sessions are
+  // already revoked, but a client that misses or ignores the event would
+  // otherwise stay connected and keep receiving pushes. Deferred one tick so
+  // the force_logout frame is flushed before the transport closes.
+  if (kicked.length > 0) {
+    const io = ioRef;
+    setImmediate(() => {
+      for (const id of kicked) io.sockets.sockets.get(id)?.disconnect(true);
+    });
   }
 
   if (pushed > 0) {

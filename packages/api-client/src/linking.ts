@@ -29,6 +29,8 @@ import {
   type LinkingScanResponse,
   type PhonePresencePayload,
   type RefreshResponse,
+  type RelayMessage,
+  type RelayPollResponse,
   type RelaySendRequest,
 } from "@wpt/shared";
 import { createRealtimeClient } from "./socket.js";
@@ -222,6 +224,10 @@ export function createWebSessionApi(config: WebSessionApiConfig) {
     /** Relay send: queued server-side; never depends on the phone being online. */
     relaySend: (accessToken: string, body: RelaySendRequest) =>
       postJson<{ count: number }>(baseUrl, "/relay/send", body, accessToken),
+
+    /** Every undelivered envelope for this device (used after `queue_more`). */
+    relayPoll: (accessToken: string) =>
+      postJson<RelayPollResponse>(baseUrl, "/relay/poll", {}, accessToken),
   };
 }
 
@@ -243,6 +249,10 @@ export interface SessionChannel {
   onPhonePresence(cb: (p: PhonePresencePayload) => void): () => void;
   /** The server refused the handshake (revoked / invalid token). */
   onAuthError(cb: (message: string) => void): () => void;
+  /** A relayed envelope: live, or drained after a reconnect. */
+  onMessage(cb: (m: RelayMessage) => void): () => void;
+  /** The reconnect drain was capped; fetch the rest via relayPoll. */
+  onQueueMore(cb: () => void): () => void;
   readonly socket: Socket;
   close(): void;
 }
@@ -273,6 +283,18 @@ export function createSessionChannel(config: SessionChannelConfig): SessionChann
       socket.on("connect_error", handler);
       return () => {
         socket.off("connect_error", handler);
+      };
+    },
+    onMessage(cb) {
+      socket.on(SESSION_EVENTS.message, cb);
+      return () => {
+        socket.off(SESSION_EVENTS.message, cb);
+      };
+    },
+    onQueueMore(cb) {
+      socket.on(SESSION_EVENTS.queueMore, cb);
+      return () => {
+        socket.off(SESSION_EVENTS.queueMore, cb);
       };
     },
     close() {

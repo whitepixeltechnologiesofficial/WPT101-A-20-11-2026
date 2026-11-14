@@ -66,6 +66,13 @@ export const SESSION_EVENTS = {
    * Optional for the real backend to emit.
    */
   phonePresence: "phone_presence",
+  /** Server → device: one relayed envelope (live, or drained on reconnect). */
+  message: "message",
+  /**
+   * Server → device: the reconnect drain hit its per-connect cap; fetch the
+   * rest with POST /relay/poll. Clients do this silently (WEB-R1.5).
+   */
+  queueMore: "queue_more",
 } as const;
 
 // ── Linking channel ────────────────────────────────────────────────────
@@ -167,4 +174,22 @@ export interface PhonePresencePayload {
 export interface RelaySendRequest {
   clientMessageId: string;
   recipients: Array<{ deviceId: string; ciphertext: string }>;
+}
+
+/** `message` push payload, and each item of a /relay/poll response. */
+export interface RelayMessage {
+  id: string;
+  senderDeviceId: string | null;
+  /** hex */
+  ciphertext: string | null;
+  messageType: string;
+  sizeBytes: number | null;
+  clientMessageId: string | null;
+  /** ISO 8601 */
+  createdAt: string;
+}
+
+/** POST /relay/poll response: every undelivered envelope for this device. */
+export interface RelayPollResponse {
+  messages: RelayMessage[];
 }

@@ -192,29 +192,6 @@ button.ghost {
   flex: 1;
 }
 
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--muted);
-}
-
-.dot-on {
-  background: var(--accent);
-}
-
-.banner {
-  background: var(--banner);
-  color: var(--banner-text);
-  padding: 10px 16px;
-  font-size: 14px;
-}
-
-.banner-error {
-  background: var(--error);
-  color: var(--error-text);
-}
-
 .chat-list {
   padding: 12px 16px;
   flex: 1;

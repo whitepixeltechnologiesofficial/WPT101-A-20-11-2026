@@ -16,7 +16,12 @@
 
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { LINKING_TOKEN_PATTERN, type LinkedPayload, type PhonePresencePayload } from "@wpt/shared";
+import {
+  LINKING_TOKEN_PATTERN,
+  type LinkedPayload,
+  type PhonePresencePayload,
+  type RelayMessage,
+} from "@wpt/shared";
 import {
   LinkingError,
   createLinkingChannel,
@@ -239,6 +244,47 @@ describe("(4) force_logout", () => {
     const kicked = nextEvent<void>((cb) => s.onForceLogout(cb));
     await linkWeb();
     await kicked;
+  });
+});
+
+describe("WEB-R1.5 reconnect sync", () => {
+  it("drains the backlog on reconnect; past the cap, queue_more + relayPoll fetch the rest", async () => {
+    const p = await linkWeb();
+    // Web is offline while the phone sends a large backlog.
+    assert.equal(mock.controls.sendToWeb(120), 120);
+
+    const s = sessionChannel(p);
+    const got = new Set<string>();
+    s.onMessage((m) => got.add(m.id));
+    await nextEvent<void>((cb) => s.onQueueMore(cb));
+    assert.equal(got.size, 50, "drain is capped per connect");
+
+    const { messages } = await api.relayPoll(p.accessToken);
+    for (const m of messages) got.add(m.id);
+    assert.equal(got.size, 120, "poll completes the backlog");
+  });
+
+  it("delivers live while connected", async () => {
+    const p = await linkWeb();
+    const s = sessionChannel(p);
+    await nextEvent<void>((cb) => {
+      s.socket.on("connect", cb);
+      return () => s.socket.off("connect", cb);
+    });
+    const live = nextEvent<RelayMessage>((cb) => s.onMessage(cb));
+    mock.controls.sendToWeb(1);
+    assert.ok((await live).id);
+  });
+});
+
+describe("WEB-R1.8 old credentials after force_logout", () => {
+  it("rejects the old access token on HTTP and the socket handshake", async () => {
+    const p = await linkWeb();
+    mock.controls.forceLogout();
+    await rejectsWith(api.relayPoll(p.accessToken), "INVALID_TOKEN");
+    const s = sessionChannel(p);
+    const err = await nextEvent<string>((cb) => s.onAuthError(cb));
+    assert.equal(err, "Session revoked");
   });
 });
 

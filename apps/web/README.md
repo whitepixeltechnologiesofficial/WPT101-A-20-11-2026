@@ -34,10 +34,15 @@ pnpm --filter @wpt/api-client test       # mock behaviours (1)–(5) (WEB-R1.0)
 3. The QR is replaced every 60s; the server rejects an old token with `TOKEN_EXPIRED`.
 4. The phone scans; the backend pushes access + refresh tokens down the same channel.
 5. Web lands on the chat list. It keeps working when the phone is offline (WEB-R1.4).
-6. Log out revokes the session; `force_logout` sends Web back to the QR with a notice.
 
-## Legacy
+## Session lifecycle
 
-`server.js`, `public/index.html`, `public/phone.html`, `vendor/`, `sealine/` and
-`qr-login/` are the old Express QR demo (`pnpm --filter web legacy:start`).
-WEB-R1.9 removes them; nothing in `app/` uses them.
+| Event | What happens |
+| --- | --- |
+| Phone offline / Web reconnects (R1.4, R1.5) | Nothing visible. Queued messages drain into the background inbox; a capped drain (`queue_more`) is finished with `/relay/poll`. No syncing UI or console output. |
+| **Log out** (R1.6) | Session ends in this browser at once and `/linking/logoff` revokes it server-side. Offline? The request is queued and re-sent on start, on `online`, and every 30s until the server confirms. Old access and refresh tokens are rejected afterwards. |
+| **Close the tab** (R1.7) | Nothing. The session is kept in `localStorage` and resumes on reopen with no rescan. |
+| **New-phone login** (R1.8) | The backend revokes every session, pushes `force_logout` and closes the socket. Web immediately shows "session ended, scan again". |
+
+Private/incognito windows discard `localStorage` when closed, so there a
+closed window needs a rescan. That is expected browser behaviour, not a bug.
