@@ -84,11 +84,15 @@ router.post(
     // token (never registered, or older than 60s) and reuse (already
     // locked by a prior successful or in-flight scan) — both return
     // the same terminal response to the caller.
-    const entry = tryConsumeLinkingToken(token);
-    if (!entry) {
-      res.status(410).json({ error: "TOKEN_INVALID_OR_EXPIRED" });
+    const consumed = tryConsumeLinkingToken(token);
+    if ("error" in consumed) {
+      // TOKEN_EXPIRED / TOKEN_ALREADY_USED / TOKEN_UNKNOWN (@wpt/shared
+      // LinkingScanError): distinct so the phone can tell the user to
+      // refresh an expired QR instead of showing a generic error.
+      res.status(410).json({ error: consumed.error });
       return;
     }
+    const { entry } = consumed;
 
     try {
       const db = getDb();

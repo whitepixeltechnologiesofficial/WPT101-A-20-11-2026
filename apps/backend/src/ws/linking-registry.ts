@@ -38,22 +38,37 @@
  */
 
 import type { Namespace, Socket } from "socket.io";
+import {
+  LINKING_EVENTS,
+  LINKING_TOKEN_PATTERN,
+  LINKING_TOKEN_TTL_MS,
+  type LinkedPayload,
+  type LinkExpiredPayload,
+  type LinkingIdentityBundle,
+  type LinkingRegisterError,
+  type LinkingScanError,
+} from "@wpt/shared";
 
-const TTL_MS = 60_000;
+// Shapes come from @wpt/shared (linking.ts): the WEB-R1.0 contract that the
+// Web client and its mock also compile against. Do not redefine them here.
+export type { LinkedPayload, LinkingIdentityBundle };
+
+const TTL_MS = LINKING_TOKEN_TTL_MS;
 const SWEEP_INTERVAL_MS = 5_000;
 
-export type LinkingIdentityBundle = {
-  identityPublicKey: string;
-  signingPublicKey?: string;
-};
+/**
+ * Tokens that expired or were used are remembered so they can NEVER be
+ * registered again (WEB-R1.3: no token valid past 60s under any
+ * circumstance, including a re-register that would restart the clock).
+ * Kept for an hour to bound memory; tokens are 256-bit CSPRNG values.
+ */
+const TOMBSTONE_RETENTION_MS = 60 * 60_000;
+type Tombstone = { kind: "expired" | "used"; at: number };
+const tombstones = new Map<string, Tombstone>();
 
-export type LinkedPayload = {
-  accessToken: string;
-  refreshToken: string;
-  userId: string;
-  deviceId: string;
-  sessionId: string;
-};
+function tombstone(token: string, kind: Tombstone["kind"]): void {
+  if (!tombstones.has(token)) tombstones.set(token, { kind, at: Date.now() });
+}
 
 type LinkingEntry = {
   createdAt: number;
@@ -86,12 +101,7 @@ function isExpired(entry: LinkingEntry, now = Date.now()): boolean {
  * the token), this just rejects obviously-malformed input cheaply.
  */
 export function isPlausibleLinkingToken(token: unknown): token is string {
-  return (
-    typeof token === "string" &&
-    token.length >= 32 &&
-    token.length <= 256 &&
-    /^[A-Za-z0-9_-]+$/.test(token)
-  );
+  return typeof token === "string" && LINKING_TOKEN_PATTERN.test(token);
 }
 
 /**
@@ -107,16 +117,24 @@ export function registerLinkingSocket(
   socket: Socket,
   token: string,
   identity: LinkingIdentityBundle,
-): { deliveredPayload: LinkedPayload | null } {
+):
+  | { ok: true; expiresAt: string; deliveredPayload: LinkedPayload | null }
+  | { ok: false; error: LinkingRegisterError } {
   const now = Date.now();
   let entry = entries.get(token);
 
   if (entry && isExpired(entry, now)) {
-    entries.delete(token);
+    expireEntry(token);
     entry = undefined;
   }
 
   if (!entry) {
+    // Single use: an expired or consumed token never comes back, so a
+    // re-register can't restart its 60s clock.
+    const tomb = tombstones.get(token);
+    if (tomb) {
+      return { ok: false, error: tomb.kind === "used" ? "TOKEN_ALREADY_USED" : "TOKEN_EXPIRED" };
+    }
     entry = {
       createdAt: now,
       identity,
@@ -125,12 +143,30 @@ export function registerLinkingSocket(
       deliveredPayload: null,
     };
     entries.set(token, entry);
+  } else if (entry.identity.identityPublicKey !== identity.identityPublicKey) {
+    // The token is visible to anyone who can see the screen; the identity
+    // key is not. Only the browser that registered the token may rejoin its
+    // room. Otherwise a photographed QR, registered from another browser
+    // within the TTL, would be handed the replayed accountLinked credentials.
+    return { ok: false, error: "TOKEN_ALREADY_USED" };
   }
 
   entry.socketId = socket.id;
   socket.join(room(token));
 
-  return { deliveredPayload: entry.deliveredPayload };
+  return {
+    ok: true,
+    expiresAt: new Date(entry.createdAt + TTL_MS).toISOString(),
+    deliveredPayload: entry.deliveredPayload,
+  };
+}
+
+/** Drop an expired entry, remember it, and tell a still-connected Web. */
+function expireEntry(token: string): void {
+  entries.delete(token);
+  tombstone(token, "expired");
+  const payload: LinkExpiredPayload = { reason: "ttl" };
+  nsRef?.to(room(token)).emit(LINKING_EVENTS.linkExpired, payload);
 }
 
 /** Drop the socket id on disconnect — the entry itself survives until TTL/consumption, so a reconnect within the window still works. */
@@ -152,16 +188,24 @@ export function unregisterLinkingSocket(socket: Socket): void {
  * atomic only up to the first await, which is exactly what makes two
  * concurrent scans of the same token unable to both pass.
  */
-export function tryConsumeLinkingToken(token: string): LinkingEntry | null {
+export function tryConsumeLinkingToken(
+  token: string,
+): { entry: LinkingEntry } | { error: Exclude<LinkingScanError, "INVALID_TOKEN" | "LINK_FAILED"> } {
   const entry = entries.get(token);
-  if (!entry) return null;
-  if (isExpired(entry)) {
-    entries.delete(token);
-    return null;
+  if (!entry) {
+    // Distinct reasons so the phone can say "QR expired, refresh it"
+    // rather than a generic failure (WEB-R1.0 / WEB-R1.3 edge case).
+    const tomb = tombstones.get(token);
+    if (tomb) return { error: tomb.kind === "used" ? "TOKEN_ALREADY_USED" : "TOKEN_EXPIRED" };
+    return { error: "TOKEN_UNKNOWN" };
   }
-  if (entry.locked) return null; // already used or a scan is in flight
+  if (isExpired(entry)) {
+    expireEntry(token);
+    return { error: "TOKEN_EXPIRED" };
+  }
+  if (entry.locked) return { error: "TOKEN_ALREADY_USED" }; // used, or a scan is in flight
   entry.locked = true;
-  return entry;
+  return { entry };
 }
 
 /**
@@ -184,7 +228,8 @@ export function rollbackLinkingConsumption(token: string): void {
 export function pushLinkedPayload(token: string, payload: LinkedPayload): void {
   const entry = entries.get(token);
   if (entry) entry.deliveredPayload = payload;
-  nsRef?.to(room(token)).emit("accountLinked", payload);
+  tombstone(token, "used");
+  nsRef?.to(room(token)).emit(LINKING_EVENTS.accountLinked, payload);
 }
 
 // Periodic sweep for entries whose 60s TTL has elapsed — mirrors the
@@ -194,9 +239,9 @@ export function pushLinkedPayload(token: string, payload: LinkedPayload): void {
 setInterval(() => {
   const now = Date.now();
   for (const [token, entry] of entries) {
-    if (isExpired(entry, now)) {
-      nsRef?.to(room(token)).emit("linkExpired", { reason: "ttl" });
-      entries.delete(token);
-    }
+    if (isExpired(entry, now)) expireEntry(token);
+  }
+  for (const [token, t] of tombstones) {
+    if (now - t.at > TOMBSTONE_RETENTION_MS) tombstones.delete(token);
   }
 }, SWEEP_INTERVAL_MS).unref();

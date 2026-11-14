@@ -1,3 +1,5 @@
+import { WebApp } from "./web-app";
+
 export default function HomePage() {
-  return <main>@wpt/web</main>;
+  return <WebApp />;
 }

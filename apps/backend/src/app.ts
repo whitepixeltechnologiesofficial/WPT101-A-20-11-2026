@@ -3,7 +3,14 @@ import cors from "cors";
 import helmet from "helmet";
 import { createServer, type Server as HttpServer } from "node:http";
 import { Server as SocketServer } from "socket.io";
-import { API_VERSION, SOCKET_NAMESPACE } from "@wpt/shared";
+import {
+  API_VERSION,
+  LINKING_EVENTS,
+  LINKING_SOCKET_NAMESPACE,
+  SOCKET_NAMESPACE,
+  type LinkingRegisterAck,
+  type LinkingRegisterRequest,
+} from "@wpt/shared";
 import onboardingRoutes from "./routes/onboarding.js";
 import profileRoutes from "./routes/profile.js";
 import debugRoutes from "./routes/debug.js";
@@ -101,15 +108,15 @@ export function createApp(): BackendServer {
   // by this. Security here comes from the linking token itself
   // (high-entropy, single-use, server-stamped 60s TTL) rather than from
   // request-level auth — see ws/linking-registry.ts for the full model.
-  const linkingNamespace = io.of("/linking");
+  const linkingNamespace = io.of(LINKING_SOCKET_NAMESPACE);
   initLinkingNamespace(linkingNamespace);
 
   linkingNamespace.on("connection", (socket) => {
     socket.on(
-      "register",
+      LINKING_EVENTS.register,
       (
-        data: { token?: string; identityPublicKey?: string; signingPublicKey?: string } | undefined,
-        ack?: (response: { ok: boolean; error?: string }) => void,
+        data: Partial<LinkingRegisterRequest> | undefined,
+        ack?: (response: LinkingRegisterAck) => void,
       ) => {
         const token = data?.token;
         const identityPublicKey = data?.identityPublicKey;
@@ -120,18 +127,23 @@ export function createApp(): BackendServer {
           return;
         }
 
-        const { deliveredPayload } = registerLinkingSocket(socket, token, {
+        const result = registerLinkingSocket(socket, token, {
           identityPublicKey,
           signingPublicKey,
         });
 
-        ack?.({ ok: true });
+        if (!result.ok) {
+          ack?.({ ok: false, error: result.error });
+          return;
+        }
+
+        ack?.({ ok: true, expiresAt: result.expiresAt });
 
         // Reconnect-within-TTL case: the phone already finished linking
         // while this socket was disconnected — deliver immediately
         // instead of making Web wait for a push that already happened.
-        if (deliveredPayload) {
-          socket.emit("accountLinked", deliveredPayload);
+        if (result.deliveredPayload) {
+          socket.emit(LINKING_EVENTS.accountLinked, result.deliveredPayload);
         }
       },
     );
