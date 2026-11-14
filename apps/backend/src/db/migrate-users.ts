@@ -28,7 +28,7 @@ async function main() {
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS "public"."users" (
-      "id" varchar(64) PRIMARY KEY NOT NULL,
+      "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
       "phone_number" varchar(20) NOT NULL,
       "created_at" timestamp with time zone DEFAULT now() NOT NULL
     );

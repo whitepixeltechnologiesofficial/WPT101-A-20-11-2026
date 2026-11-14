@@ -9,7 +9,7 @@
  * users.id; they are typed here to match the Drizzle users schema.
  */
 
-import { pgTable, uuid, varchar, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, uuid, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { users } from "./users-schema.js";
 import { groups } from "./groups-schema.js";
@@ -18,10 +18,10 @@ export const chatMutes = pgTable(
   "chat_mutes",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    userId: varchar("user_id", { length: 64 })
+    userId: uuid("user_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
-    mutedUserId: varchar("muted_user_id", { length: 64 }).references(() => users.id, {
+    mutedUserId: uuid("muted_user_id").references(() => users.id, {
       onDelete: "cascade",
     }),
     groupId: uuid("group_id").references(() => groups.id, { onDelete: "cascade" }),

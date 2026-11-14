@@ -61,7 +61,7 @@ BEGIN
     BEGIN  -- inner block: everything below is rolled back
         -- A dashboard session must belong to a real admin.
         BEGIN
-            INSERT INTO public.dashboard_sessions (dashboard_admin_id, token_lookup, token_hash, expires_at)
+            INSERT INTO public.dashboard_sessions (admin_id, token_lookup, refresh_token_hash, refresh_token_expires_at)
             VALUES (gen_random_uuid(), 'x', 'x', now() + interval '1 hour');
             r := r || ARRAY['dashboard session for a non-admin rejected', 'FAIL'];
         EXCEPTION WHEN foreign_key_violation THEN
@@ -72,7 +72,7 @@ BEGIN
         INSERT INTO public.dashboard_admins (email, password_hash)
         VALUES ('db26-verify-' || gen_random_uuid() || '@example.invalid', 'x') RETURNING id INTO v_admin;
         SELECT count(*) INTO v_n FROM public.sessions;
-        INSERT INTO public.dashboard_sessions (dashboard_admin_id, token_lookup, token_hash, expires_at)
+        INSERT INTO public.dashboard_sessions (admin_id, token_lookup, refresh_token_hash, refresh_token_expires_at)
         VALUES (v_admin, 'db26verifylookup', repeat('x', 60), now() + interval '1 hour');
         SELECT (SELECT count(*) FROM public.sessions) = v_n
            AND NOT EXISTS (SELECT 1 FROM public.sessions WHERE token_lookup = 'db26verifylookup') INTO v_ok;

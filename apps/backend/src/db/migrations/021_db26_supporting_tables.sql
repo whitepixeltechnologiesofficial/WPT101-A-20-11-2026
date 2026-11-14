@@ -25,29 +25,80 @@
 BEGIN;
 
 -- ── 1. dashboard_sessions ───────────────────────────────────
--- Mirrors the sessions token model (lookup key + bcrypt hash +
--- revoked_at kill switch) but belongs only to dashboard_admins.
+-- Column layout matches the table already live on Supabase, created by
+-- the dashboard-auth work (src/auth/dashboard.ts): token_lookup (first
+-- 32 hex chars of SHA-256) for indexed lookup, refresh_token_hash
+-- (bcrypt), refresh_token_expires_at, and revoked_at as the kill switch.
+-- Belongs ONLY to dashboard_admins.
 CREATE TABLE IF NOT EXISTS public.dashboard_sessions (
-    id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    dashboard_admin_id uuid NOT NULL
-        CONSTRAINT dashboard_sessions_dashboard_admin_id_fk
+    id                       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    admin_id                 uuid NOT NULL
+        CONSTRAINT dashboard_sessions_admin_id_fk
         REFERENCES public.dashboard_admins (id) ON DELETE CASCADE,
-    -- first 32 hex chars of SHA-256(raw token), for indexed lookup
-    token_lookup       varchar(32) NOT NULL,
-    -- bcrypt hash of the token; the raw token is never stored
-    token_hash         varchar(60) NOT NULL,
-    expires_at         timestamptz NOT NULL,
-    -- kill switch: non-null = session revoked (logout / forced sign-out)
-    revoked_at         timestamptz,
-    last_seen_at       timestamptz,
-    created_at         timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT dashboard_sessions_expiry_chk CHECK (expires_at > created_at)
+    token_lookup             varchar(32) NOT NULL,
+    refresh_token_hash       varchar(60) NOT NULL,
+    refresh_token_expires_at timestamptz NOT NULL,
+    revoked_at               timestamptz,
+    ip_address               varchar(45),
+    user_agent               text,
+    created_at               timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS dashboard_sessions_token_lookup_uidx
-    ON public.dashboard_sessions (token_lookup);
+-- A table created earlier without the link (Drizzle push from another
+-- branch) gets it here. NOT VALID: enforced for every new row without
+-- failing on any historical orphan.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.dashboard_sessions'::regclass
+          AND contype = 'f'
+          AND confrelid = 'public.dashboard_admins'::regclass
+    ) THEN
+        ALTER TABLE public.dashboard_sessions
+            ADD CONSTRAINT dashboard_sessions_admin_id_fk
+            FOREIGN KEY (admin_id) REFERENCES public.dashboard_admins (id)
+            ON DELETE CASCADE NOT VALID;
+    END IF;
+END
+$$;
+
 CREATE INDEX IF NOT EXISTS dashboard_sessions_admin_id_idx
-    ON public.dashboard_sessions (dashboard_admin_id);
+    ON public.dashboard_sessions (admin_id);
+CREATE INDEX IF NOT EXISTS dashboard_sessions_token_lookup_idx
+    ON public.dashboard_sessions (token_lookup);
+CREATE INDEX IF NOT EXISTS dashboard_sessions_revoked_at_idx
+    ON public.dashboard_sessions (revoked_at);
+
+-- ── 1b. Older, incompatible copies of the next three tables ─
+-- Supabase already had push_tokens (user_id/platform), chat_mutes and
+-- rate_limit_counters in a different, EMPTY shape, so CREATE TABLE IF
+-- NOT EXISTS skipped them and the indexes below failed. An empty table
+-- in the old shape is rebuilt; one that holds rows stops the migration
+-- instead of losing data.
+DO $$
+DECLARE
+    t      text;
+    marker text;
+    n      bigint;
+BEGIN
+    FOR t, marker IN VALUES ('push_tokens', 'device_id'),
+                            ('chat_mutes', 'muted_user_id'),
+                            ('rate_limit_counters', 'window_start')
+    LOOP
+        IF to_regclass('public.' || t) IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = t AND column_name = marker
+        ) THEN
+            EXECUTE format('SELECT count(*) FROM public.%I', t) INTO n;
+            IF n > 0 THEN
+                RAISE EXCEPTION 'DB-2.6: public.% exists in an older layout and has % row(s); migrate it by hand', t, n;
+            END IF;
+            EXECUTE format('DROP TABLE public.%I', t);
+        END IF;
+    END LOOP;
+END
+$$;
 
 -- ── 2. push_tokens ──────────────────────────────────────────
 DO $$
